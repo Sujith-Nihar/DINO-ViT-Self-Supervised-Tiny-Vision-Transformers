@@ -1,0 +1,421 @@
+Self-Supervised ViT on TinyImageNet & STL-10 (DINO-Style)
+
+This project is implemented as a single Jupyter notebook. It trains a self-supervised Vision Transformer (ViT-Tiny) on TinyImageNet using a DINO-style setup and evaluates the learned features with:
+
+* k-NN classification on TinyImageNet
+* A supervised linear probe on TinyImageNet
+* Transfer to STL-10 using a DINO ViT (feature extraction, k-NN, few-shot)
+* Attention visualization from the DINO ViT
+
+The code is intended to run in an environment like Google Colab with a GPU.
+
+---
+
+1. MAIN COMPONENTS
+
+---
+
+1.1 Configuration
+
+At the top of the notebook there is a configuration dictionary controlling model and training hyperparameters, for example:
+
+* image_size: 128
+* batch_size: 256
+* num_workers: 0
+* epochs: 300
+* lr: 1e-4
+* weight_decay: 1e-6
+* teacher_momentum: 0.996
+* n_global_crops: 2
+* n_local_crops: 2
+
+Key points:
+
+* Uses a ViT-Tiny model (vit_tiny_patch16_224 from timm) as the backbone.
+* Trains for up to 300 epochs on TinyImageNet (usually reduced for debugging).
+* Uses 2 global crops and 2 local crops per image as in DINO.
+
+1.2 TinyImageNet Preparation
+
+The notebook:
+
+* Downloads TinyImageNet (tiny-imagenet-200).
+* Unzips and prepares the validation split into a standard ImageFolder structure.
+
+The helper function:
+
+* Reads val_annotations.txt.
+* Moves validation images from val/images into class-specific folders under val/<class_id>/.
+* Deletes the original val/images directory.
+
+After this, both train and val of TinyImageNet can be loaded with torchvision.datasets.ImageFolder.
+
+1.3 DINO-Style Multi-Crop Augmentation
+
+The class DinoMultiCropTransform implements DINO-style augmentations:
+
+* Uses ImageNet mean/std normalization.
+* Creates multiple views of each input image:
+
+  * Global crops (larger random resized crops, scale around 0.4–1.0).
+  * Local crops (smaller random crops, scale around 0.08–0.4).
+* Each crop includes:
+
+  * Random horizontal flip
+  * Color jitter
+  * Random grayscale
+  * Gaussian blur
+  * Optional solarization
+  * Normalization
+
+The transform returns a list of crops (tensors) per input sample, which are then fed to student and teacher networks.
+
+The unlabeled TinyImageNet pretraining dataset:
+
+* Uses ImageFolder on tiny-imagenet-200/train with DinoMultiCropTransform as the transform.
+* Uses a DataLoader with:
+
+  * batch_size = CFG["batch_size"]
+  * shuffle = True
+  * drop_last = True
+  * pin_memory, num_workers from config
+
+1.4 ViT-Tiny Backbone and DINO Head
+
+Backbone:
+
+* A helper function creates a ViT-Tiny model:
+
+  * vit_tiny_patch16_224 from timm
+  * num_classes = 0 (no classifier head)
+* Two copies are created:
+
+  * student_backbone (trainable)
+  * teacher_backbone (EMA copy, not trainable)
+* The teacher is initialized with the same weights as the student and all its parameters are set to requires_grad = False.
+
+DINO Head (projection head):
+
+* An MLP that projects backbone features into a lower-dimensional space (DINO logits).
+* Final layer uses weight normalization.
+* Output dimension out_dim is the DINO logits size (e.g. 65536 or configurable).
+
+Teacher head:
+
+* A copy of the student head, weights updated with EMA, no gradients.
+
+1.5 DINO Loss and Teacher Update
+
+DINOLoss:
+
+* Implements the DINO objective to align student and teacher outputs:
+
+  * Applies temperature scaling to student and teacher logits.
+  * Maintains a “center” vector (moving average of teacher outputs) for stability.
+  * Updates this center with a momentum term after each batch.
+  * Computes cross-entropy between teacher probabilities and student probabilities across crop pairs (teacher’s global crops vs all student crops).
+* The loss is averaged over pairs and batch.
+
+Teacher update:
+
+* After each optimizer step on the student, teacher parameters are updated with an exponential moving average:
+
+  * teacher_param = m * teacher_param + (1 - m) * student_param
+  * This is done for both backbone and head parameters.
+* The momentum m is given by teacher_momentum (e.g., 0.996).
+
+1.6 DINO Training Loop (Self-Supervised on TinyImageNet)
+
+Training procedure:
+
+* For each epoch (up to CFG["epochs"]):
+
+  * Iterate over pretrain_loader (unlabeled TinyImageNet).
+  * For each batch:
+
+    * Receive a list of crops (global + local).
+    * Pass all crops through the student backbone and head.
+    * Pass only global crops through the teacher backbone and head.
+    * Compute DINO loss between teacher and student outputs.
+    * Backpropagate and update the student backbone and head using AdamW.
+    * Update teacher parameters using EMA.
+  * Log the average loss and epoch time.
+
+Note:
+
+* 300 epochs on TinyImageNet with ViT-Tiny can be slow.
+* For debugging, reduce epochs, batch_size, and possibly image_size.
+
+---
+
+2. TINYIMAGENET EVALUATION
+
+---
+
+2.1 Evaluation Datasets and Transforms
+
+Separate transforms are defined for supervised evaluation:
+
+* Train evaluation transform:
+
+  * RandomResizedCrop with scale around (0.6, 1.0)
+  * RandomHorizontalFlip
+  * ToTensor()
+  * Normalize (ImageNet mean/std)
+
+* Validation evaluation transform:
+
+  * Resize to image_size + some padding (e.g. +8)
+  * CenterCrop to image_size
+  * ToTensor()
+  * Normalize (ImageNet mean/std)
+
+Datasets:
+
+* tiny_train_eval = ImageFolder(TINY_ROOT/train, eval_train_transform)
+* tiny_val_eval   = ImageFolder(TINY_ROOT/val,   eval_val_transform)
+
+DataLoaders are created for both train and validation evaluation sets.
+
+2.2 Feature Extraction Helper
+
+Feature extraction function:
+
+* Sets the backbone to eval mode.
+* Loops over a DataLoader:
+
+  * Moves images to device.
+  * Runs backbone(images) to get features.
+  * If output is 4D (B, C, H, W), it averages spatial dimensions to obtain B x C features.
+* Accumulates features and labels on CPU.
+* Returns:
+
+  * all_feats: tensor of shape (N_samples, feature_dim)
+  * all_labels: tensor of shape (N_samples,)
+
+Used for:
+
+* k-NN evaluation
+* Linear probe training
+
+2.3 k-NN Evaluation on TinyImageNet
+
+After self-supervised training:
+
+* Extract features for train_eval_loader and val_eval_loader using the backbone.
+* Convert features and labels to NumPy.
+* Fit a KNeighborsClassifier (e.g., k=5, Euclidean metric) on train features and labels.
+* Predict labels for validation features.
+* Compute validation accuracy with accuracy_score.
+
+The resulting k-NN accuracy measures the quality of the learned representations without training any new deep layers.
+
+2.4 Linear Probe on TinyImageNet
+
+LinearProbe model:
+
+* A simple linear layer:
+
+  * Input size: feature dimension from the backbone.
+  * Output size: number of TinyImageNet classes (200).
+
+Procedure:
+
+1. Run one batch through the frozen backbone to determine feature dimension.
+2. Instantiate LinearProbe(feat_dim, num_classes=200).
+3. Freeze backbone parameters (requires_grad = False).
+4. Train the linear probe only:
+
+   * For a number of epochs (e.g. 100–300, can be reduced).
+   * Use CrossEntropyLoss and Adam (or similar).
+   * Train on train_eval_loader, evaluate on val_eval_loader.
+5. Track training loss and validation accuracy.
+
+This is a standard linear probe evaluation to quantify representation quality.
+
+---
+
+3. STL-10 WITH PRETRAINED DINO VIT
+
+---
+
+3.1 STL-10 Data
+
+The notebook loads STL-10 with transforms similar to ImageNet-style DINO transforms for evaluation:
+
+* Resize to 256 with bicubic interpolation.
+* Center crop to 224.
+* Convert to tensor.
+* Normalize using ImageNet mean/std (0.485, 0.456, 0.406 for mean, 0.229, 0.224, 0.225 for std).
+
+Datasets:
+
+* stl_train (split="train")
+* stl_test  (split="test")
+
+DataLoaders:
+
+* train_loader (shuffle=True, batch_size around 128)
+* test_loader  (shuffle=False, batch_size around 128)
+
+3.2 DINO Feature Extraction for STL-10
+
+A helper function dino_features assumes a ViT model with DINO-style utilities:
+
+* Uses model.get_intermediate_layers(x, n=1) to get features from one intermediate layer.
+* The returned tensor has shape [B, N, C] (batch, tokens, channels).
+* If use_cls=True:
+
+  * Takes the CLS token (token 0) as the representation.
+* If use_cls=False:
+
+  * Averages patch tokens (tokens 1 onward) to create a pooled feature.
+
+Pipeline:
+
+* Run all train images through the DINO ViT to obtain features.
+* Run all test images through the same model to obtain features.
+* Train a simple classifier or use k-NN on top of these features.
+* Evaluate test accuracy.
+
+3.3 Few-Shot Classification on STL-10
+
+To test few-shot transfer:
+
+* Select a small number K of examples per class from STL-10 train (e.g., 5-shot).
+* Extract features for these few-shot samples.
+* Use these features and labels as a small training set.
+* Use a 1-NN or k-NN classifier:
+
+  * Train on few-shot features.
+  * Evaluate on features from the full STL-10 test set.
+* Report few-shot accuracy.
+
+This shows how well the pretrained DINO ViT transfers with limited labeled data.
+
+3.4 Attention Visualization
+
+The notebook includes utilities to visualize what the DINO ViT attends to:
+
+* get_last_selfattention(model, img_batch):
+
+  * Returns attention maps from the last self-attention layer.
+
+* visualize_dino_attention_random():
+
+  * Picks a random STL-10 test image.
+  * Runs it through the ViT to get attention maps.
+  * Displays the original image and attention maps for different heads.
+
+* attention_to_mask(attn_map, threshold):
+
+  * Converts attention scores into a binary mask based on a threshold.
+  * Higher threshold -> more focused regions.
+
+* visualize_attention_mask_random(threshold):
+
+  * Shows original image and an overlaid attention mask to highlight regions the model focuses on.
+
+These use Matplotlib and PIL-like utilities (tensor_to_pil, side-by-side plotting).
+
+---
+
+4. REQUIREMENTS
+
+---
+
+Main libraries:
+
+* Python 3.x
+* PyTorch
+* Torchvision
+* timm
+* scikit-learn
+* matplotlib
+* numpy
+* pillow
+
+On Colab, many of these are pre-installed. The notebook typically includes cells like:
+
+* pip install timm
+* pip install scikit-learn
+
+Ensure you have:
+
+* GPU support (CUDA) for reasonable training time.
+* Sufficient RAM and disk for datasets.
+
+---
+
+5. HOW TO RUN
+
+---
+
+Recommended: Google Colab
+
+1. Upload the notebook file (e.g., "TinyImageNet (3).ipynb") to Google Colab.
+2. Set runtime to GPU:
+
+   * Runtime -> Change runtime type -> Hardware accelerator -> GPU.
+3. Run cells from top to bottom:
+
+   * Imports and configuration.
+   * TinyImageNet download and preparation.
+   * DINO multi-crop transform and DataLoader.
+   * ViT-Tiny backbone, DINO head, and DINO loss.
+   * Self-supervised DINO training loop.
+   * TinyImageNet k-NN evaluation.
+   * TinyImageNet linear probe training and evaluation.
+   * STL-10 data and DINO-based feature extraction.
+   * STL-10 k-NN / few-shot experiments.
+   * Attention visualization utilities and examples.
+
+Speeding up / debugging:
+
+* Reduce epochs (for example from 300 to 20).
+* Reduce batch_size if memory is an issue.
+* Optionally reduce image_size (e.g., 96 instead of 128) if you also adjust model input size.
+
+---
+
+6. PROJECT STRUCTURE (LOGICAL)
+
+---
+
+Although everything is in a single notebook, the logical structure is:
+
+1. Setup and configuration.
+2. TinyImageNet dataset download and reorganization.
+3. DINO-style multi-crop augmentation and DataLoader for self-supervision.
+4. ViT-Tiny backbone, DINO projection head, DINO loss.
+5. Self-supervised DINO training on TinyImageNet (student-teacher, EMA).
+6. TinyImageNet evaluation:
+
+   * k-NN with backbone features.
+   * Linear probe with a frozen backbone.
+7. STL-10 experiments:
+
+   * Using a pretrained DINO ViT to extract features.
+   * k-NN and linear classification.
+   * Few-shot classification.
+   * Attention visualization.
+
+---
+
+7. NOTES AND CAVEATS
+
+---
+
+* Training for 300 epochs is computationally expensive; expect long run times without a strong GPU.
+* The DINO-specific model methods (get_last_selfattention, get_intermediate_layers) must be available in your ViT implementation; these are standard in DINO-compatible models.
+* TinyImageNet and STL-10 are downloaded automatically by the notebook; ensure you have internet access and enough disk space.
+* For fast experimentation, always start with fewer epochs and a smaller configuration, then scale up.
+
+---
+
+8. ACKNOWLEDGEMENTS
+
+---
+
+* The self-supervised learning approach is inspired by the DINO paper and official implementation from Facebook Research.
+* Vision Transformer (ViT) implementation is based on timm (PyTorch Image Models).
